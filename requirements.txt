@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+torchaudio
+ultralytics
+opencv-python
+timm
+numpy<2.0.0
+requests

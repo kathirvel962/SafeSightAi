@@ -1,0 +1,21 @@
+{
+  "device": "cuda",
+  "camera": {
+    "index": 0,
+    "width": 640,
+    "height": 480,
+    "fps": 30
+  },
+  "yolo": {
+    "model_name": "yolov8n.pt",
+    "conf_threshold": 0.5,
+    "iou_threshold": 0.45,
+    "person_class_id": 0,
+    "save_screenshots": false,
+    "save_video": false,
+    "output_dir": "output"
+  },
+  "midas": {
+    "model_type": "MiDaS_small"
+  }
+}
