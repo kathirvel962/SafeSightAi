@@ -17,5 +17,10 @@
   },
   "midas": {
     "model_type": "MiDaS_small"
+  },
+  "safety": {
+    "warning_threshold": 100.0,
+    "danger_threshold": 150.0,
+    "critical_threshold": 200.0
   }
 }

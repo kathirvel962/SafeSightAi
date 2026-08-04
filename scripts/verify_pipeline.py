@@ -99,10 +99,11 @@ def main():
         if fps_target <= 0:
             fps_target = 30
 
-    # Now load detector and depth models
+    # Now load detector, depth, and safety models
     from modules.detector import WorkerDetector
     from modules.depth import DepthEstimator
     from modules.proximity import ProximityExtractor
+    from modules.safety import SafetyZoneManager
 
     detector = WorkerDetector(model_name=model_name, conf_threshold=conf_threshold, iou_threshold=iou_threshold, device=device)
     if not detector.load_model():
@@ -115,6 +116,7 @@ def main():
         sys.exit(1)
 
     proximity_extractor = ProximityExtractor()
+    safety_manager = SafetyZoneManager(config.get("safety", {}))
 
     # Run on static image
     if args.source != "webcam" and not args.source.endswith((".mp4", ".avi", ".mov", ".mkv")):
@@ -149,19 +151,39 @@ def main():
         # Extract proximity data and sort by nearness (closest first)
         workers = proximity_extractor.process_detections(detections, depth_map)
 
-        # Annotate RGB frame with bounding boxes and proximity depth labels
+        # Evaluate overall system threat state
+        system_state, actions = safety_manager.evaluate_system_state(workers)
+
+        # Annotate RGB frame with bounding boxes and safety zone labels
         annotated_frame = frame.copy()
         for i, worker in enumerate(workers):
             bbox = worker["bbox"]
-            is_closest = (i == 0) # first in sorted list is closest
-            color = (0, 0, 255) if is_closest else (0, 255, 0) # Red for closest, Green for others
+            zone_info = safety_manager.evaluate_worker(worker)
+            color = zone_info["color"]
+            zone_name = zone_info["zone"]
+            is_closest = (i == 0)
             tag = " [CLOSEST]" if is_closest else ""
             
             cv2.rectangle(annotated_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-            label = f"ID:{worker['id']} Conf:{worker['confidence']:.2f} Depth:{worker['relative_depth']:.1f}{tag}"
+            label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
             cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            logger.info(f"Worker ID={worker['id']} | Conf={worker['confidence']:.2f} | Relative-Depth={worker['relative_depth']:.1f} | Box={bbox} | Closest={is_closest}")
+            logger.info(f"Worker ID={worker['id']} | Zone={zone_name} | Relative-Depth={worker['relative_depth']:.1f} | Box={bbox} | Closest={is_closest}")
+
+        # Apply static mock warning overlays for static visualization
+        ah, aw = annotated_frame.shape[:2]
+        if actions["fullscreen_flash"]:
+            red_overlay = np.zeros_like(annotated_frame)
+            red_overlay[:] = (0, 0, 255)
+            cv2.addWeighted(annotated_frame, 0.7, red_overlay, 0.3, 0, annotated_frame)
+        elif actions["border_flash"]:
+            cv2.rectangle(annotated_frame, (0, 0), (aw - 1, ah - 1), (0, 0, 255), 10)
+
+        # Print mock alerts to console
+        if actions["sound_request"] is not None:
+            logger.warning(f"[MOCK AUDIO ALERT] Requesting {actions['sound_request']}-frequency warning sound!")
+        if actions["log_request"]:
+            logger.error(f"[MOCK COLLISION EVENT] Logging Critical Proximity Risk for worker ID {actions['closest_worker_id']}!")
 
         # Colorize depth map (Inferno colormap)
         color_depth = cv2.applyColorMap(depth_map, cv2.COLORMAP_INFERNO)
@@ -170,10 +192,22 @@ def main():
         stacked = cv2.hconcat([annotated_frame, color_depth])
         h, w = stacked.shape[:2]
 
+        # Draw overall system status overlay
+        status_colors = {
+            "SAFE": (0, 255, 0),
+            "WARNING": (0, 255, 255),
+            "DANGER": (0, 0, 255),
+            "CRITICAL": (0, 0, 255)
+        }
+        sys_color = status_colors.get(system_state, (0, 255, 0))
+        cv2.putText(stacked, f"SYSTEM STATUS: {system_state}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sys_color, 2)
+
         # Overlay benchmarks
-        cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(stacked, f"Workers: {len(detections)}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(stacked, f"Workers: {len(workers)}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        logger.info(f"YOLO latency: {latency_yolo:.1f}ms | MiDaS latency: {latency_midas:.1f}ms | Workers: {len(workers)} | System Status: {system_state}")
 
         logger.info(f"YOLO latency: {latency_yolo:.1f}ms | MiDaS latency: {latency_midas:.1f}ms | Detections: {len(detections)}")
 
@@ -195,6 +229,8 @@ def main():
 
         prev_time = 0
         last_reconnect_attempt = 0
+        last_sound_log_time = 0.0
+        last_collision_log_time = 0.0
         
         frame_idx = 0
         cached_depth_map = None
@@ -256,20 +292,45 @@ def main():
                 if cached_depth_map is not None:
                     workers = proximity_extractor.process_detections(detections, cached_depth_map)
                 
-                # Annotate RGB frame with bounding boxes and proximity depth labels
+                # Evaluate overall system threat state
+                system_state, actions = safety_manager.evaluate_system_state(workers)
+
+                # Annotate RGB frame with bounding boxes and safety zone labels
                 for i, worker in enumerate(workers):
                     bbox = worker["bbox"]
-                    is_closest = (i == 0) # first in sorted list is closest
-                    color = (0, 0, 255) if is_closest else (0, 255, 0) # Red for closest, Green for others
+                    zone_info = safety_manager.evaluate_worker(worker)
+                    color = zone_info["color"]
+                    zone_name = zone_info["zone"]
+                    is_closest = (i == 0)
                     tag = " [CLOSEST]" if is_closest else ""
                     
                     cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-                    label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f}{tag}"
+                    label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
                     cv2.putText(frame, label, (bbox[0], bbox[1] - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Apply dynamic flashing overlays
+                flash_on = int(time.time() * 4) % 2 == 0
+                if actions["fullscreen_flash"] and flash_on:
+                    red_overlay = np.zeros_like(frame)
+                    red_overlay[:] = (0, 0, 255)
+                    cv2.addWeighted(frame, 0.75, red_overlay, 0.25, 0, frame)
+                elif actions["border_flash"] and flash_on:
+                    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
+
+                # Print rate-limited mock alerts to console
+                now = time.time()
+                if actions["sound_request"] is not None and now - last_sound_log_time > 2.0:
+                    logger.warning(f"[MOCK AUDIO ALERT] Requesting {actions['sound_request']}-frequency warning sound!")
+                    last_sound_log_time = now
+                if actions["log_request"] and now - last_collision_log_time > 2.0:
+                    logger.error(f"[MOCK COLLISION EVENT] Logging Critical Proximity Risk for worker ID {actions['closest_worker_id']}!")
+                    last_collision_log_time = now
             else:
                 latency_yolo = 0.0
                 latency_midas = 0.0
+                system_state = "SAFE"
+                actions = {"sound_request": None, "log_request": False}
 
             # Colorize the cached/current depth map
             if cached_depth_map is not None:
@@ -290,12 +351,22 @@ def main():
             status_text = "CONNECTED" if is_connected else "DISCONNECTED"
             status_color = (0, 255, 0) if is_connected else (0, 0, 255)
             
-            cv2.putText(stacked, f"CAMERA: {status_text}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-            cv2.putText(stacked, f"Pipeline FPS: {fps:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(stacked, f"Workers: {len(workers)}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(stacked, f"Decoupling Rate: {args.depth_freq}x", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # System Status Banner
+            status_colors = {
+                "SAFE": (0, 255, 0),
+                "WARNING": (0, 255, 255),
+                "DANGER": (0, 0, 255),
+                "CRITICAL": (0, 0, 255)
+            }
+            sys_color = status_colors.get(system_state, (0, 255, 0))
+            cv2.putText(stacked, f"SYSTEM STATUS: {system_state}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sys_color, 2)
+            
+            cv2.putText(stacked, f"CAMERA: {status_text}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            cv2.putText(stacked, f"Pipeline FPS: {fps:.1f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(stacked, f"Workers: {len(workers)}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(stacked, f"Decoupling Rate: {args.depth_freq}x", (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, "Press 'f' to toggle Fullscreen, 'q' to Quit", (20, sh - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             frame_idx += 1
@@ -303,8 +374,8 @@ def main():
             if args.no_gui:
                 # Headless logging
                 if is_connected:
-                    closest_text = f" | Closest Worker: ID={workers[0]['id']} Depth={workers[0]['relative_depth']:.1f}" if workers else ""
-                    logger.info(f"Pipeline Running - Workers: {len(workers)} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms{closest_text}")
+                    closest_text = f" | Closest Worker: ID={workers[0]['id']} Depth={workers[0]['relative_depth']:.1f} ({system_state})" if workers else ""
+                    logger.info(f"Pipeline Running - Workers: {len(workers)} | Status: {system_state} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms{closest_text}")
                 time.sleep(0.01)
             else:
                 cv2.imshow(window_name, stacked)
