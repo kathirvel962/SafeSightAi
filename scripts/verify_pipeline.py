@@ -12,8 +12,6 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from modules.camera import WideAngleCamera
-from modules.detector import WorkerDetector
-from modules.depth import DepthEstimator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -102,6 +100,10 @@ def main():
             fps_target = 30
 
     # Now load detector and depth models
+    from modules.detector import WorkerDetector
+    from modules.depth import DepthEstimator
+    from modules.proximity import ProximityExtractor
+
     detector = WorkerDetector(model_name=model_name, conf_threshold=conf_threshold, iou_threshold=iou_threshold, device=device)
     if not detector.load_model():
         logger.error("Could not load YOLOv8 detector. Exiting.")
@@ -111,6 +113,8 @@ def main():
     if not depth_estimator.load_model():
         logger.error("Could not load MiDaS depth estimator. Exiting.")
         sys.exit(1)
+
+    proximity_extractor = ProximityExtractor()
 
     # Run on static image
     if args.source != "webcam" and not args.source.endswith((".mp4", ".avi", ".mov", ".mkv")):
@@ -142,13 +146,22 @@ def main():
             logger.error("Depth estimation failed.")
             sys.exit(1)
 
-        # Annotate RGB frame with bounding boxes
+        # Extract proximity data and sort by nearness (closest first)
+        workers = proximity_extractor.process_detections(detections, depth_map)
+
+        # Annotate RGB frame with bounding boxes and proximity depth labels
         annotated_frame = frame.copy()
-        for det in detections:
-            bbox = det["bbox"]
-            cv2.rectangle(annotated_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
-            label = f"Person {det['confidence']:.2f}"
-            cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        for i, worker in enumerate(workers):
+            bbox = worker["bbox"]
+            is_closest = (i == 0) # first in sorted list is closest
+            color = (0, 0, 255) if is_closest else (0, 255, 0) # Red for closest, Green for others
+            tag = " [CLOSEST]" if is_closest else ""
+            
+            cv2.rectangle(annotated_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+            label = f"ID:{worker['id']} Conf:{worker['confidence']:.2f} Depth:{worker['relative_depth']:.1f}{tag}"
+            cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            logger.info(f"Worker ID={worker['id']} | Conf={worker['confidence']:.2f} | Relative-Depth={worker['relative_depth']:.1f} | Box={bbox} | Closest={is_closest}")
 
         # Colorize depth map (Inferno colormap)
         color_depth = cv2.applyColorMap(depth_map, cv2.COLORMAP_INFERNO)
@@ -223,7 +236,7 @@ def main():
 
             # Define variables
             h, w = frame.shape[:2]
-            detections = []
+            workers = []
 
             if is_connected and not (args.source == "webcam" and not ret):
                 # 1. Run worker detection on every frame
@@ -239,13 +252,21 @@ def main():
                     if depth is not None:
                         cached_depth_map = depth
                 
-                # Annotate RGB frame with bounding boxes
-                for det in detections:
-                    bbox = det["bbox"]
-                    cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
-                    label = f"Person {det['confidence']:.2f}"
+                # Extract proximity data and sort by nearness (closest first)
+                if cached_depth_map is not None:
+                    workers = proximity_extractor.process_detections(detections, cached_depth_map)
+                
+                # Annotate RGB frame with bounding boxes and proximity depth labels
+                for i, worker in enumerate(workers):
+                    bbox = worker["bbox"]
+                    is_closest = (i == 0) # first in sorted list is closest
+                    color = (0, 0, 255) if is_closest else (0, 255, 0) # Red for closest, Green for others
+                    tag = " [CLOSEST]" if is_closest else ""
+                    
+                    cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+                    label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f}{tag}"
                     cv2.putText(frame, label, (bbox[0], bbox[1] - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             else:
                 latency_yolo = 0.0
                 latency_midas = 0.0
@@ -273,7 +294,7 @@ def main():
             cv2.putText(stacked, f"Pipeline FPS: {fps:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(stacked, f"Workers: {len(detections)}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(stacked, f"Workers: {len(workers)}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(stacked, f"Decoupling Rate: {args.depth_freq}x", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, "Press 'f' to toggle Fullscreen, 'q' to Quit", (20, sh - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -282,7 +303,8 @@ def main():
             if args.no_gui:
                 # Headless logging
                 if is_connected:
-                    logger.info(f"Pipeline Running - Workers: {len(detections)} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms")
+                    closest_text = f" | Closest Worker: ID={workers[0]['id']} Depth={workers[0]['relative_depth']:.1f}" if workers else ""
+                    logger.info(f"Pipeline Running - Workers: {len(workers)} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms{closest_text}")
                 time.sleep(0.01)
             else:
                 cv2.imshow(window_name, stacked)
