@@ -99,11 +99,12 @@ def main():
         if fps_target <= 0:
             fps_target = 30
 
-    # Now load detector, depth, and safety models
+    # Now load detector, depth, safety, and tracking models
     from modules.detector import WorkerDetector
     from modules.depth import DepthEstimator
     from modules.proximity import ProximityExtractor
     from modules.safety import SafetyZoneManager
+    from modules.tracking import WorkerTracker
 
     detector = WorkerDetector(model_name=model_name, conf_threshold=conf_threshold, iou_threshold=iou_threshold, device=device)
     if not detector.load_model():
@@ -117,6 +118,7 @@ def main():
 
     proximity_extractor = ProximityExtractor()
     safety_manager = SafetyZoneManager(config.get("safety", {}))
+    tracker = WorkerTracker(iou_threshold=0.3, depth_window_size=5, persistence_threshold=10)
 
     # Run on static image
     if args.source != "webcam" and not args.source.endswith((".mp4", ".avi", ".mov", ".mkv")):
@@ -148,8 +150,8 @@ def main():
             logger.error("Depth estimation failed.")
             sys.exit(1)
 
-        # Extract proximity data and sort by nearness (closest first)
-        workers = proximity_extractor.process_detections(detections, depth_map)
+        # Extract proximity data and track identities across frames
+        workers = tracker.update(detections, depth_map, proximity_extractor)
 
         # Evaluate overall system threat state
         system_state, actions = safety_manager.evaluate_system_state(workers)
@@ -288,9 +290,9 @@ def main():
                     if depth is not None:
                         cached_depth_map = depth
                 
-                # Extract proximity data and sort by nearness (closest first)
+                # Extract proximity data and track identities across frames
                 if cached_depth_map is not None:
-                    workers = proximity_extractor.process_detections(detections, cached_depth_map)
+                    workers = tracker.update(detections, cached_depth_map, proximity_extractor)
                 
                 # Evaluate overall system threat state
                 system_state, actions = safety_manager.evaluate_system_state(workers)
