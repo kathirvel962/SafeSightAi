@@ -22,5 +22,10 @@
     "warning_threshold": 100.0,
     "danger_threshold": 150.0,
     "critical_threshold": 200.0
+  },
+  "wearable": {
+    "base_ip": "192.168.1.100",
+    "udp_host": "127.0.0.1",
+    "udp_port": 5005
   }
 }

@@ -99,12 +99,13 @@ def main():
         if fps_target <= 0:
             fps_target = 30
 
-    # Now load detector, depth, safety, and tracking models
+    # Now load detector, depth, safety, tracking, and communication models
     from modules.detector import WorkerDetector
     from modules.depth import DepthEstimator
     from modules.proximity import ProximityExtractor
     from modules.safety import SafetyZoneManager
     from modules.tracking import WorkerTracker
+    from modules.communication import WearableCommunicator
 
     detector = WorkerDetector(model_name=model_name, conf_threshold=conf_threshold, iou_threshold=iou_threshold, device=device)
     if not detector.load_model():
@@ -119,6 +120,7 @@ def main():
     proximity_extractor = ProximityExtractor()
     safety_manager = SafetyZoneManager(config.get("safety", {}))
     tracker = WorkerTracker(iou_threshold=0.3, depth_window_size=5, persistence_threshold=10)
+    wearable_communicator = WearableCommunicator(config.get("wearable", {}))
 
     # Run on static image
     if args.source != "webcam" and not args.source.endswith((".mp4", ".avi", ".mov", ".mkv")):
@@ -156,8 +158,9 @@ def main():
         # Evaluate overall system threat state
         system_state, actions = safety_manager.evaluate_system_state(workers)
 
-        # Annotate RGB frame with bounding boxes and safety zone labels
+        # Annotate RGB frame with bounding boxes, safety labels, and trigger wearable alerts
         annotated_frame = frame.copy()
+        simulated_alerts = []
         for i, worker in enumerate(workers):
             bbox = worker["bbox"]
             zone_info = safety_manager.evaluate_worker(worker)
@@ -170,7 +173,11 @@ def main():
             label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
             cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            logger.info(f"Worker ID={worker['id']} | Zone={zone_name} | Relative-Depth={worker['relative_depth']:.1f} | Box={bbox} | Closest={is_closest}")
+            # Send simulated alert
+            alert = wearable_communicator.send_alert(worker["id"], zone_name)
+            simulated_alerts.append(alert)
+            
+            logger.info(f"Worker ID={worker['id']} | Zone={zone_name} | Depth={worker['relative_depth']:.1f} | IP={alert['device_ip']} | Vib={alert['vibration']} | Light={alert['light']} | Closest={is_closest}")
 
         # Apply static mock warning overlays for static visualization
         ah, aw = annotated_frame.shape[:2]
@@ -208,6 +215,15 @@ def main():
         cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(stacked, f"Workers: {len(workers)}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Draw Wearable alerts overlays
+        cv2.putText(stacked, "WEARABLE ALERTS TRANSMISSION:", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        y_offset = 195
+        for alert in simulated_alerts:
+            if alert["zone"] != "SAFE":
+                alert_text = f"ID {alert['worker_id']} ({alert['device_ip']}): VIB={alert['vibration']} LIGHT={alert['light']}"
+                cv2.putText(stacked, alert_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                y_offset += 25
 
         logger.info(f"YOLO latency: {latency_yolo:.1f}ms | MiDaS latency: {latency_midas:.1f}ms | Workers: {len(workers)} | System Status: {system_state}")
 
@@ -297,7 +313,8 @@ def main():
                 # Evaluate overall system threat state
                 system_state, actions = safety_manager.evaluate_system_state(workers)
 
-                # Annotate RGB frame with bounding boxes and safety zone labels
+                # Annotate RGB frame, trigger wearable alerts, and draw safety zone labels
+                simulated_alerts = []
                 for i, worker in enumerate(workers):
                     bbox = worker["bbox"]
                     zone_info = safety_manager.evaluate_worker(worker)
@@ -310,6 +327,10 @@ def main():
                     label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
                     cv2.putText(frame, label, (bbox[0], bbox[1] - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # Trigger simulated wearable alert
+                    alert = wearable_communicator.send_alert(worker["id"], zone_name)
+                    simulated_alerts.append(alert)
                 
                 # Apply dynamic flashing overlays
                 flash_on = int(time.time() * 4) % 2 == 0
@@ -333,6 +354,7 @@ def main():
                 latency_midas = 0.0
                 system_state = "SAFE"
                 actions = {"sound_request": None, "log_request": False}
+                simulated_alerts = []
 
             # Colorize the cached/current depth map
             if cached_depth_map is not None:
@@ -369,6 +391,16 @@ def main():
             cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, f"Workers: {len(workers)}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(stacked, f"Decoupling Rate: {args.depth_freq}x", (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Wearable alerts overlays
+            cv2.putText(stacked, "WEARABLE ALERTS TRANSMISSION:", (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            y_offset = 285
+            for alert in simulated_alerts:
+                if alert["zone"] != "SAFE":
+                    alert_text = f"ID {alert['worker_id']} ({alert['device_ip']}): VIB={alert['vibration']} LIGHT={alert['light']}"
+                    cv2.putText(stacked, alert_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    y_offset += 25
+            
             cv2.putText(stacked, "Press 'f' to toggle Fullscreen, 'q' to Quit", (20, sh - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             frame_idx += 1
@@ -377,7 +409,9 @@ def main():
                 # Headless logging
                 if is_connected:
                     closest_text = f" | Closest Worker: ID={workers[0]['id']} Depth={workers[0]['relative_depth']:.1f} ({system_state})" if workers else ""
-                    logger.info(f"Pipeline Running - Workers: {len(workers)} | Status: {system_state} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms{closest_text}")
+                    alert_details = ", ".join([f"ID {a['worker_id']} ({a['device_ip']})->{a['vibration']}/{a['light']}" for a in simulated_alerts if a['zone'] != 'SAFE'])
+                    alert_str = f" | Alerts: [{alert_details}]" if alert_details else ""
+                    logger.info(f"Pipeline Running - Workers: {len(workers)} | Status: {system_state} | FPS: {fps:.1f} | YOLO: {latency_yolo:.1f}ms | MiDaS: {latency_midas:.1f}ms{closest_text}{alert_str}")
                 time.sleep(0.01)
             else:
                 cv2.imshow(window_name, stacked)
