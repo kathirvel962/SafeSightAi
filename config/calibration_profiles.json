@@ -1,0 +1,61 @@
+{
+  "profiles": {
+    "excavator_rear_3m_high": {
+      "profile_name": "excavator_rear_3m_high",
+      "camera_height_meters": 3.0,
+      "camera_pitch_degrees": -15,
+      "lighting": "daylight",
+      "calibration_points": [
+        {
+          "target_distance_m": 1.0,
+          "median_midas_depth": 240.0,
+          "bbox_height_px": 450,
+          "bbox_width_px": 200,
+          "bbox_bottom_center": [
+            320,
+            400
+          ],
+          "confidence": 0.9
+        },
+        {
+          "target_distance_m": 3.0,
+          "median_midas_depth": 180.0,
+          "bbox_height_px": 210,
+          "bbox_width_px": 100,
+          "bbox_bottom_center": [
+            320,
+            300
+          ],
+          "confidence": 0.85
+        },
+        {
+          "target_distance_m": 5.0,
+          "median_midas_depth": 110.0,
+          "bbox_height_px": 120,
+          "bbox_width_px": 60,
+          "bbox_bottom_center": [
+            320,
+            260
+          ],
+          "confidence": 0.8
+        },
+        {
+          "target_distance_m": 10.0,
+          "median_midas_depth": 45.0,
+          "bbox_height_px": 55,
+          "bbox_width_px": 30,
+          "bbox_bottom_center": [
+            320,
+            240
+          ],
+          "confidence": 0.75
+        }
+      ],
+      "zone_thresholds": {
+        "warning_threshold": 97.0,
+        "danger_threshold": 145.0,
+        "critical_threshold": 210.0
+      }
+    }
+  }
+}
