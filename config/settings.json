@@ -22,7 +22,8 @@
     "warning_threshold": 97.0,
     "danger_threshold": 145.0,
     "critical_threshold": 210.0,
-    "active_profile": "excavator_rear_3m_high"
+    "active_profile": "excavator_rear_3m_high",
+    "min_certainty_confidence": 0.6
   },
   "wearable": {
     "base_ip": "192.168.1.100",

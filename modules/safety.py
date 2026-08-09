@@ -19,6 +19,7 @@ class SafetyZoneManager:
             safety_config = {}
         
         self.active_profile = safety_config.get("active_profile", None)
+        self.min_certainty_confidence = safety_config.get("min_certainty_confidence", 0.6)
         self.warning_threshold = safety_config.get("warning_threshold", 100.0)
         self.danger_threshold = safety_config.get("danger_threshold", 150.0)
         self.critical_threshold = safety_config.get("critical_threshold", 200.0)
@@ -46,7 +47,8 @@ class SafetyZoneManager:
                 logger.warning(f"Calibration profiles file not found at {profiles_path}. Using defaults.")
         
         logger.info(f"SafetyZoneManager initialized with thresholds: "
-                    f"Warning={self.warning_threshold}, Danger={self.danger_threshold}, Critical={self.critical_threshold}")
+                    f"Warning={self.warning_threshold}, Danger={self.danger_threshold}, Critical={self.critical_threshold}, "
+                    f"MinCertaintyConf={self.min_certainty_confidence}")
 
     def evaluate_worker(self, worker):
         """
@@ -54,19 +56,32 @@ class SafetyZoneManager:
         
         Returns:
             dict: Zone info containing:
-                - zone (str): 'SAFE', 'WARNING', 'DANGER', 'CRITICAL'
+                - zone (str): 'SAFE', 'UNCERTAIN', 'WARNING', 'DANGER', 'CRITICAL'
                 - color (tuple): BGR color code for overlays
                 - flash (bool): True if overlay should flash
                 - sound_request (str): None, 'low', or 'high'
                 - log_request (bool): True if collision logging is required
         """
         depth = worker.get("relative_depth", 0.0)
+        confidence = worker.get("confidence", 1.0)
         
         # BGR Colors
         GREEN = (0, 255, 0)
         YELLOW = (0, 255, 255)
+        ORANGE = (0, 165, 255)
         RED = (0, 0, 255)
+        GRAY = (128, 128, 128)
         
+        # Validation checks for uncertain detections
+        if confidence < self.min_certainty_confidence or depth <= 0.0:
+            return {
+                "zone": "UNCERTAIN",
+                "color": GRAY,
+                "flash": False,
+                "sound_request": None,
+                "log_request": False
+            }
+            
         if depth < self.warning_threshold:
             return {
                 "zone": "SAFE",
@@ -86,7 +101,7 @@ class SafetyZoneManager:
         elif depth < self.critical_threshold:
             return {
                 "zone": "DANGER",
-                "color": RED,
+                "color": ORANGE,
                 "flash": True,
                 "sound_request": "low",
                 "log_request": False
@@ -136,8 +151,8 @@ class SafetyZoneManager:
         log_request = False
         
         # Priority mapping for max zone resolution
-        zone_priority = {"SAFE": 0, "WARNING": 1, "DANGER": 2, "CRITICAL": 3}
-        reverse_priority = {0: "SAFE", 1: "WARNING", 2: "DANGER", 3: "CRITICAL"}
+        zone_priority = {"SAFE": 0, "UNCERTAIN": 1, "WARNING": 2, "DANGER": 3, "CRITICAL": 4}
+        reverse_priority = {0: "SAFE", 1: "UNCERTAIN", 2: "WARNING", 3: "DANGER", 4: "CRITICAL"}
         
         max_priority = 0
         

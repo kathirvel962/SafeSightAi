@@ -99,13 +99,14 @@ def main():
         if fps_target <= 0:
             fps_target = 30
 
-    # Now load detector, depth, safety, tracking, and communication models
+    # Now load detector, depth, safety, tracking, communication, and alert decision models
     from modules.detector import WorkerDetector
     from modules.depth import DepthEstimator
     from modules.proximity import ProximityExtractor
     from modules.safety import SafetyZoneManager
     from modules.tracking import WorkerTracker
     from modules.communication import WearableCommunicator
+    from modules.alert_decision import AlertDecisionEngine
 
     detector = WorkerDetector(model_name=model_name, conf_threshold=conf_threshold, iou_threshold=iou_threshold, device=device)
     if not detector.load_model():
@@ -121,6 +122,7 @@ def main():
     safety_manager = SafetyZoneManager(config.get("safety", {}))
     tracker = WorkerTracker(iou_threshold=0.3, depth_window_size=5, persistence_threshold=10)
     wearable_communicator = WearableCommunicator(config.get("wearable", {}))
+    alert_engine = AlertDecisionEngine(config.get("safety", {}))
 
     # Run on static image
     if args.source != "webcam" and not args.source.endswith((".mp4", ".avi", ".mov", ".mkv")):
@@ -155,15 +157,50 @@ def main():
         # Extract proximity data and track identities across frames
         workers = tracker.update(detections, depth_map, proximity_extractor)
 
-        # Evaluate overall system threat state
-        system_state, actions = safety_manager.evaluate_system_state(workers)
+        # Update alert engine with active tracker IDs
+        active_ids = [w["id"] for w in workers]
+        alert_engine.prune_inactive_workers(active_ids)
+
+        # For each worker, evaluate their confirmed zone
+        confirmed_zones = []
+        for worker in workers:
+            zone_info = alert_engine.process_worker(worker, safety_manager)
+            worker["confirmed_zone_info"] = zone_info
+            confirmed_zones.append(zone_info["zone"])
+
+        # Evaluate overall system threat state based on confirmed zones
+        system_state = alert_engine.evaluate_global_state(confirmed_zones)
+        
+        # Build system aggregate actions
+        border_flash = False
+        fullscreen_flash = False
+        sound_request = None
+        log_request = False
+        closest_worker_id = workers[0]["id"] if workers else None
+
+        if system_state == "DANGER":
+            border_flash = True
+            sound_request = "low"
+        elif system_state == "CRITICAL":
+            border_flash = True
+            fullscreen_flash = True
+            sound_request = "high"
+            log_request = True
+
+        actions = {
+            "border_flash": border_flash,
+            "fullscreen_flash": fullscreen_flash,
+            "sound_request": sound_request,
+            "log_request": log_request,
+            "closest_worker_id": closest_worker_id
+        }
 
         # Annotate RGB frame with bounding boxes, safety labels, and trigger wearable alerts
         annotated_frame = frame.copy()
         simulated_alerts = []
         for i, worker in enumerate(workers):
             bbox = worker["bbox"]
-            zone_info = safety_manager.evaluate_worker(worker)
+            zone_info = worker["confirmed_zone_info"]
             color = zone_info["color"]
             zone_name = zone_info["zone"]
             is_closest = (i == 0)
@@ -310,14 +347,49 @@ def main():
                 if cached_depth_map is not None:
                     workers = tracker.update(detections, cached_depth_map, proximity_extractor)
                 
-                # Evaluate overall system threat state
-                system_state, actions = safety_manager.evaluate_system_state(workers)
+                # Update alert engine with active tracker IDs
+                active_ids = [w["id"] for w in workers]
+                alert_engine.prune_inactive_workers(active_ids)
+
+                # For each worker, evaluate their confirmed zone
+                confirmed_zones = []
+                for worker in workers:
+                    zone_info = alert_engine.process_worker(worker, safety_manager)
+                    worker["confirmed_zone_info"] = zone_info
+                    confirmed_zones.append(zone_info["zone"])
+
+                # Evaluate overall system threat state based on confirmed zones
+                system_state = alert_engine.evaluate_global_state(confirmed_zones)
+                
+                # Build system aggregate actions
+                border_flash = False
+                fullscreen_flash = False
+                sound_request = None
+                log_request = False
+                closest_worker_id = workers[0]["id"] if workers else None
+
+                if system_state == "DANGER":
+                    border_flash = True
+                    sound_request = "low"
+                elif system_state == "CRITICAL":
+                    border_flash = True
+                    fullscreen_flash = True
+                    sound_request = "high"
+                    log_request = True
+
+                actions = {
+                    "border_flash": border_flash,
+                    "fullscreen_flash": fullscreen_flash,
+                    "sound_request": sound_request,
+                    "log_request": log_request,
+                    "closest_worker_id": closest_worker_id
+                }
 
                 # Annotate RGB frame, trigger wearable alerts, and draw safety zone labels
                 simulated_alerts = []
                 for i, worker in enumerate(workers):
                     bbox = worker["bbox"]
-                    zone_info = safety_manager.evaluate_worker(worker)
+                    zone_info = worker["confirmed_zone_info"]
                     color = zone_info["color"]
                     zone_name = zone_info["zone"]
                     is_closest = (i == 0)
