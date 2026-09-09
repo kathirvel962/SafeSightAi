@@ -1,4 +1,109 @@
-import time
+import logging
+import math
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class WorkerExcavatorProximity:
+    """Associate workers with excavators in normalized image space.
+
+    Pixel distance is normalized by the frame diagonal. MiDaS is used only as
+    a consistency gate because its output is relative, not metric distance.
+    """
+
+    def __init__(self, config=None):
+        config = config or {}
+        self.warning_distance = float(config.get("warning_distance", 0.25))
+        self.danger_distance = float(config.get("danger_distance", 0.12))
+        self.max_depth_difference = float(config.get("max_depth_difference", 0.25))
+        if self.danger_distance >= self.warning_distance:
+            raise ValueError("danger_distance must be smaller than warning_distance")
+
+    @staticmethod
+    def _bottom_center(box):
+        return ((box[0] + box[2]) / 2.0, float(box[3]))
+
+    @staticmethod
+    def _closest_point(point, box):
+        return (
+            min(max(point[0], box[0]), box[2]),
+            min(max(point[1], box[1]), box[3]),
+        )
+
+    @staticmethod
+    def _depth_at_point(depth_map, point):
+        if depth_map is None:
+            return None
+        height, width = depth_map.shape[:2]
+        x = min(max(int(point[0]), 0), width - 1)
+        y = min(max(int(point[1]), 0), height - 1)
+        x_start, x_end = max(0, x - 3), min(width, x + 4)
+        y_start, y_end = max(0, y - 3), min(height, y + 4)
+        values = depth_map[y_start:y_end, x_start:x_end]
+        values = values[values > 0]
+        return float(np.median(values)) if values.size else None
+
+    def evaluate(self, workers, excavators, frame_shape, depth_map=None):
+        """Return each worker's closest excavator and proximity state."""
+        height, width = frame_shape[:2]
+        diagonal = max(math.hypot(width, height), 1.0)
+        results = []
+
+        for worker in workers:
+            worker_point = self._bottom_center(worker["bbox"])
+            best = None
+            for excavator in excavators:
+                excavator_point = self._closest_point(worker_point, excavator["bbox"])
+                distance = math.hypot(
+                    worker_point[0] - excavator_point[0],
+                    worker_point[1] - excavator_point[1],
+                ) / diagonal
+                worker_depth = self._depth_at_point(depth_map, worker_point)
+                excavator_depth = self._depth_at_point(depth_map, excavator_point)
+                depth_difference = None
+                depth_consistent = True
+                if worker_depth is not None and excavator_depth is not None:
+                    depth_difference = abs(worker_depth - excavator_depth) / 255.0
+                    depth_consistent = depth_difference <= self.max_depth_difference
+                candidate = {
+                    "excavator_id": excavator["id"],
+                    "normalized_distance": distance,
+                    "worker_point": worker_point,
+                    "excavator_point": excavator_point,
+                    "worker_depth": worker_depth,
+                    "excavator_depth": excavator_depth,
+                    "depth_difference": depth_difference,
+                    "depth_consistent": depth_consistent,
+                }
+                if best is None or distance < best["normalized_distance"]:
+                    best = candidate
+
+            if best is None:
+                results.append({
+                    "excavator_id": None,
+                    "normalized_distance": None,
+                    "proximity_state": "NORMAL",
+                    "depth_consistent": False,
+                })
+                continue
+
+            distance = best["normalized_distance"]
+            if not best["depth_consistent"]:
+                state = "NORMAL"
+            elif distance <= self.danger_distance:
+                state = "CRITICAL"
+            elif distance <= self.warning_distance:
+                state = "WARNING"
+            else:
+                state = "NORMAL"
+            best["proximity_state"] = state
+            results.append(best)
+
+        return results
+
+    import time
 import numpy as np
 import logging
 

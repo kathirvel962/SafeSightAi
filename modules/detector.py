@@ -37,12 +37,23 @@ class WorkerDetector:
             return []
 
         try:
-            # Perform inference. Classes=0 filters for the person class automatically.
+            return self.detect_objects(frame, classes=[0])
+        except Exception as e:
+            logger.error(f"Inference error in WorkerDetector: {e}")
+            return []
+
+    def detect_objects(self, frame, classes=None):
+        """Detect objects, optionally restricting inference to class IDs."""
+        if self.model is None:
+            logger.warning("YOLO model not loaded. Call load_model() first.")
+            return []
+
+        try:
             results = self.model.predict(
-                source=frame, 
-                conf=self.conf_threshold, 
+                source=frame,
+                conf=self.conf_threshold,
                 iou=self.iou_threshold,
-                classes=[0], 
+                classes=classes,
                 device=self.device,
                 verbose=False
             )

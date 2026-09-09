@@ -62,11 +62,15 @@ def main():
     device = config.get("device", "cpu")
     yolo_cfg = config.get("yolo", {})
     midas_cfg = config.get("midas", {})
+    safety_cfg = config.get("safety", {})
 
     model_name = yolo_cfg.get("model_name", "yolov8n.pt")
     conf_threshold = yolo_cfg.get("conf_threshold", 0.5)
     iou_threshold = yolo_cfg.get("iou_threshold", 0.45)
     model_type = midas_cfg.get("model_type", "MiDaS_small")
+    excavator_model_name = yolo_cfg.get("excavator_model_name")
+    excavator_class_ids = yolo_cfg.get("excavator_class_ids", [])
+    excavator_conf_threshold = yolo_cfg.get("excavator_conf_threshold", conf_threshold)
 
     # Initialize Capture Device first if running on stream to prevent DirectShow COM deadlocks
     camera = None
@@ -102,7 +106,7 @@ def main():
     # Now load detector, depth, safety, tracking, communication, and alert decision models
     from modules.detector import WorkerDetector
     from modules.depth import DepthEstimator
-    from modules.proximity import ProximityExtractor
+    from modules.proximity import ProximityExtractor, WorkerExcavatorProximity
     from modules.safety import SafetyZoneManager
     from modules.tracking import WorkerTracker
     from modules.communication import WearableCommunicator
@@ -113,12 +117,27 @@ def main():
         logger.error("Could not load YOLOv8 detector. Exiting.")
         sys.exit(1)
 
+    excavator_detector = None
+    if excavator_model_name and excavator_class_ids:
+        excavator_detector = WorkerDetector(
+            model_name=excavator_model_name,
+            conf_threshold=excavator_conf_threshold,
+            iou_threshold=iou_threshold,
+            device=device,
+        )
+        if not excavator_detector.load_model():
+            logger.error("Could not load excavator detector. Exiting.")
+            sys.exit(1)
+    else:
+        logger.warning("No excavator model configured; proximity alerts are disabled until one is supplied.")
+
     depth_estimator = DepthEstimator(model_type=model_type, device=device)
     if not depth_estimator.load_model():
         logger.error("Could not load MiDaS depth estimator. Exiting.")
         sys.exit(1)
 
     proximity_extractor = ProximityExtractor()
+    proximity_analyzer = WorkerExcavatorProximity(safety_cfg.get("worker_excavator_proximity", {}))
     safety_manager = SafetyZoneManager(config.get("safety", {}))
     tracker = WorkerTracker(iou_threshold=0.3, depth_window_size=5, persistence_threshold=10)
     wearable_communicator = WearableCommunicator(config.get("wearable", {}))
@@ -144,6 +163,9 @@ def main():
         start_yolo = time.time()
         detections = detector.detect_workers(frame)
         latency_yolo = (time.time() - start_yolo) * 1000
+        excavators = [] if excavator_detector is None else excavator_detector.detect_objects(frame, excavator_class_ids)
+        for excavator_id, excavator in enumerate(excavators):
+            excavator["id"] = excavator_id
 
         # 2. Run depth estimation
         start_midas = time.time()
@@ -156,12 +178,22 @@ def main():
 
         # Extract proximity data and track identities across frames
         workers = tracker.update(detections, depth_map, proximity_extractor)
+        proximity_results = proximity_analyzer.evaluate(workers, excavators, frame.shape, depth_map)
+        for worker, proximity in zip(workers, proximity_results):
+            worker.update(proximity)
+            logger.info(
+                "Worker ID=%s | Excavator ID=%s | Proximity=%.3f | State=%s | Thresholds warning=%.3f danger=%.3f",
+                worker["id"], proximity["excavator_id"],
+                proximity["normalized_distance"] if proximity["normalized_distance"] is not None else -1.0,
+                proximity["proximity_state"], proximity_analyzer.warning_distance,
+                proximity_analyzer.danger_distance,
+            )
 
         # Update alert engine with active tracker IDs
         active_ids = [w["id"] for w in workers]
         alert_engine.prune_inactive_workers(active_ids)
 
-        # For each worker, evaluate their confirmed zone
+        # A still image has no temporal history, so show its immediate calibrated zone.
         confirmed_zones = []
         for worker in workers:
             zone_info = alert_engine.process_worker(worker, safety_manager)
@@ -170,6 +202,12 @@ def main():
 
         # Evaluate overall system threat state based on confirmed zones
         system_state = alert_engine.evaluate_global_state(confirmed_zones)
+        proximity_priority = {"NORMAL": 0, "WARNING": 1, "CRITICAL": 2}
+        preview_state = max(
+            (worker.get("proximity_state", "NORMAL") for worker in workers),
+            key=lambda state: proximity_priority[state],
+            default="NORMAL",
+        )
         
         # Build system aggregate actions
         border_flash = False
@@ -203,18 +241,43 @@ def main():
             zone_info = worker["confirmed_zone_info"]
             color = zone_info["color"]
             zone_name = zone_info["zone"]
+            raw_proximity_state = worker.get("proximity_state", "NORMAL")
             is_closest = (i == 0)
             tag = " [CLOSEST]" if is_closest else ""
             
             cv2.rectangle(annotated_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-            label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
+            label = (
+                f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} "
+                f"Confirmed:{zone_name} RawProximity:{raw_proximity_state}{tag}"
+            )
             cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            distance = worker.get("normalized_distance")
+            proximity_label = (
+                f"Excavator:{worker.get('excavator_id', 'N/A')} "
+                f"Distance:{'N/A' if distance is None else f'{distance:.3f}'} "
+                f"Proximity:{worker.get('proximity_state', 'NORMAL')} "
+                f"CriticalFrames:{zone_info.get('consecutive_critical', 0)}"
+            )
+            cv2.putText(
+                annotated_frame, proximity_label,
+                (bbox[0], min(annotated_frame.shape[0] - 10, bbox[3] + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1,
+            )
             
             # Send simulated alert
             alert = wearable_communicator.send_alert(worker["id"], zone_name)
             simulated_alerts.append(alert)
             
             logger.info(f"Worker ID={worker['id']} | Zone={zone_name} | Depth={worker['relative_depth']:.1f} | IP={alert['device_ip']} | Vib={alert['vibration']} | Light={alert['light']} | Closest={is_closest}")
+
+        for excavator in excavators:
+            box = excavator["bbox"]
+            cv2.rectangle(annotated_frame, (box[0], box[1]), (box[2], box[3]), (255, 0, 0), 2)
+            cv2.putText(
+                annotated_frame, f"Excavator {excavator['id']}",
+                (box[0], max(20, box[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2,
+            )
 
         # Apply static mock warning overlays for static visualization
         ah, aw = annotated_frame.shape[:2]
@@ -236,6 +299,15 @@ def main():
 
         # Merge views side-by-side
         stacked = cv2.hconcat([annotated_frame, color_depth])
+        # Keep high-resolution inputs readable in the saved preview without cropping either panel.
+        max_preview_width = 1800
+        if stacked.shape[1] > max_preview_width:
+            preview_scale = max_preview_width / stacked.shape[1]
+            stacked = cv2.resize(
+                stacked,
+                (max_preview_width, int(stacked.shape[0] * preview_scale)),
+                interpolation=cv2.INTER_AREA,
+            )
         h, w = stacked.shape[:2]
 
         # Draw overall system status overlay
@@ -245,13 +317,25 @@ def main():
             "DANGER": (0, 0, 255),
             "CRITICAL": (0, 0, 255)
         }
-        sys_color = status_colors.get(system_state, (0, 255, 0))
-        cv2.putText(stacked, f"SYSTEM STATUS: {system_state}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sys_color, 2)
+        sys_color = status_colors.get(preview_state, (0, 255, 0))
+        cv2.putText(
+            stacked, f"SYSTEM STATUS: {preview_state} (PREVIEW)",
+            (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sys_color, 2,
+        )
 
         # Overlay benchmarks
         cv2.putText(stacked, f"YOLO Latency: {latency_yolo:.1f}ms", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(stacked, f"MiDaS Latency: {latency_midas:.1f}ms", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(stacked, f"Workers: {len(workers)}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(
+            stacked,
+            "Static image: proximity is raw; live alerts require consecutive frames",
+            (20, 145),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+        )
 
         # Draw Wearable alerts overlays
         cv2.putText(stacked, "WEARABLE ALERTS TRANSMISSION:", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
@@ -271,7 +355,21 @@ def main():
             cv2.imwrite(output_path, stacked)
             logger.info(f"Saved pipeline verification output to {output_path}")
         else:
-            cv2.imshow("SafeSight AI Pipeline Verification", stacked)
+            window_name = "SafeSight AI Pipeline Verification"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            display_width = 1600
+            display_height = 850
+            preview_scale = min(
+                display_width / stacked.shape[1],
+                display_height / stacked.shape[0],
+                1.0,
+            )
+            cv2.resizeWindow(
+                window_name,
+                max(1, int(stacked.shape[1] * preview_scale)),
+                max(1, int(stacked.shape[0] * preview_scale)),
+            )
+            cv2.imshow(window_name, stacked)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
@@ -334,6 +432,9 @@ def main():
                 start_yolo = time.time()
                 detections = detector.detect_workers(frame)
                 latency_yolo = (time.time() - start_yolo) * 1000
+                excavators = [] if excavator_detector is None else excavator_detector.detect_objects(frame, excavator_class_ids)
+                for excavator_id, excavator in enumerate(excavators):
+                    excavator["id"] = excavator_id
 
                 # 2. Run depth estimation at configured frequency
                 if frame_idx % args.depth_freq == 0 or cached_depth_map is None:
@@ -346,6 +447,17 @@ def main():
                 # Extract proximity data and track identities across frames
                 if cached_depth_map is not None:
                     workers = tracker.update(detections, cached_depth_map, proximity_extractor)
+                    proximity_results = proximity_analyzer.evaluate(
+                        workers, excavators, frame.shape, cached_depth_map
+                    )
+                    for worker, proximity in zip(workers, proximity_results):
+                        worker.update(proximity)
+                        logger.debug(
+                            "Worker ID=%s | Excavator ID=%s | Proximity=%.3f | State=%s",
+                            worker["id"], proximity["excavator_id"],
+                            proximity["normalized_distance"] if proximity["normalized_distance"] is not None else -1.0,
+                            proximity["proximity_state"],
+                        )
                 
                 # Update alert engine with active tracker IDs
                 active_ids = [w["id"] for w in workers]
@@ -396,13 +508,27 @@ def main():
                     tag = " [CLOSEST]" if is_closest else ""
                     
                     cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-                    label = f"ID:{worker['id']} Depth:{worker['relative_depth']:.1f} ({zone_name}){tag}"
+                    distance = worker.get("normalized_distance")
+                    distance_text = "N/A" if distance is None else f"{distance:.3f}"
+                    label = (
+                        f"ID:{worker['id']} EX:{worker.get('excavator_id', 'N/A')} "
+                        f"D:{distance_text} ({zone_name}) "
+                        f"CF:{zone_info.get('consecutive_critical', 0)}{tag}"
+                    )
                     cv2.putText(frame, label, (bbox[0], bbox[1] - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     
                     # Trigger simulated wearable alert
                     alert = wearable_communicator.send_alert(worker["id"], zone_name)
                     simulated_alerts.append(alert)
+
+                for excavator in excavators:
+                    box = excavator["bbox"]
+                    cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (255, 0, 0), 2)
+                    cv2.putText(
+                        frame, f"Excavator {excavator['id']}", (box[0], max(20, box[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2,
+                    )
                 
                 # Apply dynamic flashing overlays
                 flash_on = int(time.time() * 4) % 2 == 0

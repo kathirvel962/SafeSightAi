@@ -19,6 +19,7 @@ class AlertDecisionEngine:
         self.danger_confirm_frames = config.get("danger_confirm_frames", 8)
         self.warning_confirm_frames = config.get("warning_confirm_frames", 15)
         self.hysteresis_epsilon = config.get("hysteresis_epsilon", 10.0)
+        self.proximity_clear_confirm_frames = config.get("proximity_clear_confirm_frames", 3)
 
         # Map tracker worker ID -> alert state dict
         self.states = {}
@@ -53,6 +54,7 @@ class AlertDecisionEngine:
         worker_id = worker["id"]
         depth = worker.get("relative_depth", 0.0)
         confidence = worker.get("confidence", 1.0)
+        proximity_state = worker.get("proximity_state")
 
         # Initialize tracking states if new worker
         if worker_id not in self.states:
@@ -60,7 +62,8 @@ class AlertDecisionEngine:
                 "confirmed_state": "SAFE",
                 "consecutive_critical": 0,
                 "consecutive_danger": 0,
-                "consecutive_warning": 0
+                "consecutive_warning": 0,
+                "consecutive_clear": 0
             }
 
         w_state = self.states[worker_id]
@@ -72,8 +75,16 @@ class AlertDecisionEngine:
         critical_thresh = safety_manager.critical_threshold
         epsilon = self.hysteresis_epsilon
 
-        # 1. Determine raw target zone taking uncertainty and hysteresis into account
-        if confidence < safety_manager.min_certainty_confidence or depth <= 0.0:
+        # 1. Prefer the worker-excavator relationship when available. Depth-only
+        # classification is retained for backwards compatibility with old callers.
+        if proximity_state is not None:
+            if proximity_state == "CRITICAL":
+                raw_zone = "CRITICAL"
+            elif proximity_state == "WARNING":
+                raw_zone = "WARNING"
+            else:
+                raw_zone = "SAFE"
+        elif confidence < safety_manager.min_certainty_confidence or depth <= 0.0:
             raw_zone = "UNCERTAIN"
         else:
             if current_confirmed == "CRITICAL":
@@ -127,6 +138,7 @@ class AlertDecisionEngine:
             w_state["consecutive_critical"] = 0
             w_state["consecutive_danger"] = 0
             w_state["consecutive_warning"] = 0
+            w_state["consecutive_clear"] = 0
         elif p_raw > p_conf:
             # Upgrade requested: requires consecutive frame confirmations
             if raw_zone == "CRITICAL":
@@ -149,9 +161,16 @@ class AlertDecisionEngine:
                 w_state["confirmed_state"] = raw_zone
                 self._reset_counters(w_state)
         else:
-            # Downgrade: Immediate transition to lower alert state (immediate cancellation)
-            w_state["confirmed_state"] = raw_zone
-            self._reset_counters(w_state)
+            # Proximity alerts clear only after stable separation. Preserve the
+            # old immediate downgrade behavior for depth-only callers/tests.
+            if proximity_state is not None and current_confirmed != "SAFE":
+                w_state["consecutive_clear"] += 1
+                if w_state["consecutive_clear"] >= self.proximity_clear_confirm_frames:
+                    w_state["confirmed_state"] = raw_zone
+                    self._reset_counters(w_state)
+            else:
+                w_state["confirmed_state"] = raw_zone
+                self._reset_counters(w_state)
 
         # 3. Retrieve confirmed attributes matching the output of safety_manager.evaluate_worker
         confirmed_zone = w_state["confirmed_state"]
@@ -176,13 +195,18 @@ class AlertDecisionEngine:
             "color": color,
             "flash": flash,
             "sound_request": sound_request,
-            "log_request": log_request
+            "log_request": log_request,
+            "proximity_state": proximity_state,
+            "consecutive_critical": w_state["consecutive_critical"],
+            "consecutive_warning": w_state["consecutive_warning"],
+            "consecutive_clear": w_state["consecutive_clear"]
         }
 
     def _reset_counters(self, w_state):
         w_state["consecutive_critical"] = 0
         w_state["consecutive_danger"] = 0
         w_state["consecutive_warning"] = 0
+        w_state["consecutive_clear"] = 0
 
     def evaluate_global_state(self, worker_zones):
         """

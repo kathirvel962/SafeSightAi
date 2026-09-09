@@ -8,6 +8,9 @@
   },
   "yolo": {
     "model_name": "yolov8n.pt",
+    "excavator_model_name": "yolov8n.pt",
+    "excavator_class_ids": [7],
+    "excavator_conf_threshold": 0.1,
     "conf_threshold": 0.5,
     "iou_threshold": 0.45,
     "person_class_id": 0,
@@ -19,6 +22,13 @@
     "model_type": "MiDaS_small"
   },
   "safety": {
+    "worker_excavator_proximity": {
+      "warning_distance": 0.25,
+      "danger_distance": 0.15,
+      "max_depth_difference": 0.25
+    },
+    "proximity_critical_confirm_frames": 3,
+    "proximity_clear_confirm_frames": 3,
     "warning_threshold": 97.0,
     "danger_threshold": 145.0,
     "critical_threshold": 210.0,

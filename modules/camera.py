@@ -18,7 +18,7 @@ class WideAngleCamera:
 
     def open(self):
         logger.info(f"Opening camera {self.index} with resolution {self.width}x{self.height}...")
-        self.cap = cv2.VideoCapture(self.index)
+        self.cap = cv2.VideoCapture(1)
         if not self.cap.isOpened():
             logger.error(f"Failed to open camera index {self.index}.")
             self.is_connected = False
